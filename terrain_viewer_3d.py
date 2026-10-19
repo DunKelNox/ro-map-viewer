@@ -467,6 +467,7 @@ class TerrainViewer3D:
         self.north_dir = 1
         self.show_walls = True
         self.flip_z = True
+        self.smooth_normals = True  # N — normales suaves por vértice (como el cliente RO)
         self.show_compass = True
         self.show_walkable = False  # G
         self.show_models = False    # M — marcadores RSW
@@ -799,6 +800,43 @@ class TerrainViewer3D:
             good1 = nlen1[:, 0] > 1e-10
             n1 = np.divide(n1, nlen1, out=np.zeros_like(n1), where=nlen1 > 1e-10)
 
+            # --- Normales por vértice ---------------------------------------
+            # Por defecto cada triángulo usa su normal plana, lo que marca el
+            # corte en diagonal de cada celda (rombos en la arena). El cliente
+            # RO / BrowEdit3 promedian las normales de las celdas que comparten
+            # la esquina. Para no suavizar acantilados, solo se mezclan celdas
+            # cuya esquina compartida está a la MISMA altura.
+            if getattr(self, 'smooth_normals', True):
+                nc = n0 + n1                                   # normal de celda
+                ncl = np.linalg.norm(nc, axis=1, keepdims=True)
+                nc = np.divide(nc, ncl, out=np.zeros_like(nc), where=ncl > 1e-10)
+                k_bot = ys - int(round(dz_bottom / 10.0))      # línea Z borde bottom
+                k_top = ys - int(round(dz_top / 10.0))         # línea Z borde top
+                def _q(h):
+                    return np.round(h[idx] * 100.0).astype(np.int64)
+                keys = np.concatenate((
+                    np.stack((xs,     k_bot, _q(h_bl)), axis=1),   # bl
+                    np.stack((xs + 1, k_bot, _q(h_br)), axis=1),   # br
+                    np.stack((xs,     k_top, _q(h_tl)), axis=1),   # tl
+                    np.stack((xs + 1, k_top, _q(h_tr)), axis=1),   # tr
+                ))
+                _, inv = np.unique(keys, axis=0, return_inverse=True)
+                inv = inv.reshape(-1)
+                acc = np.zeros((int(inv.max()) + 1, 3), dtype=np.float64)
+                np.add.at(acc, inv, np.concatenate((nc, nc, nc, nc)))
+                al = np.linalg.norm(acc, axis=1, keepdims=True)
+                acc = np.divide(acc, al, out=np.zeros_like(acc), where=al > 1e-10)
+                vn = acc[inv].reshape(4, n_top, 3)
+                vn_bl, vn_br, vn_tl, vn_tr = vn[0], vn[1], vn[2], vn[3]
+                # celdas degeneradas (normal 0): conservar la plana
+                for _vn, _fb in ((vn_bl, n0), (vn_br, n0), (vn_tl, n0), (vn_tr, n1)):
+                    bad = np.linalg.norm(_vn, axis=1) < 1e-6
+                    if np.any(bad):
+                        _vn[bad] = _fb[bad]
+            else:
+                vn_bl = vn_br = vn_tl = n0
+                vn_tr = n1
+
             # Agrupar por tex_id (pocas texturas distintas → pocos grupos)
             tex_ids = np.empty(n_top, dtype=np.int32)
             # UVs y LM se leen por superficie (no vectorizable limpio sin atlas de UV)
@@ -841,15 +879,15 @@ class TerrainViewer3D:
                     v = np.empty((int(m0.sum()), 3, 10), dtype=np.float32)
                     v[:, 0, 0:3] = p_bl[m0]
                     v[:, 0, 3:5] = uv_bl[m0]
-                    v[:, 0, 5:8] = n0[m0]
+                    v[:, 0, 5:8] = vn_bl[m0]
                     v[:, 0, 8:10] = lm_bl[m0]
                     v[:, 1, 0:3] = p_br[m0]
                     v[:, 1, 3:5] = uv_br[m0]
-                    v[:, 1, 5:8] = n0[m0]
+                    v[:, 1, 5:8] = vn_br[m0]
                     v[:, 1, 8:10] = lm_br[m0]
                     v[:, 2, 0:3] = p_tl[m0]
                     v[:, 2, 3:5] = uv_tl[m0]
-                    v[:, 2, 5:8] = n0[m0]
+                    v[:, 2, 5:8] = vn_tl[m0]
                     v[:, 2, 8:10] = lm_tl[m0]
                     chunks.append(v.reshape(-1))
                 if np.any(m1):
@@ -857,15 +895,15 @@ class TerrainViewer3D:
                     v = np.empty((int(m1.sum()), 3, 10), dtype=np.float32)
                     v[:, 0, 0:3] = p_br[m1]
                     v[:, 0, 3:5] = uv_br[m1]
-                    v[:, 0, 5:8] = n1[m1]
+                    v[:, 0, 5:8] = vn_br[m1]
                     v[:, 0, 8:10] = lm_br[m1]
                     v[:, 1, 0:3] = p_tr[m1]
                     v[:, 1, 3:5] = uv_tr[m1]
-                    v[:, 1, 5:8] = n1[m1]
+                    v[:, 1, 5:8] = vn_tr[m1]
                     v[:, 1, 8:10] = lm_tr[m1]
                     v[:, 2, 0:3] = p_tl[m1]
                     v[:, 2, 3:5] = uv_tl[m1]
-                    v[:, 2, 5:8] = n1[m1]
+                    v[:, 2, 5:8] = vn_tl[m1]
                     v[:, 2, 8:10] = lm_tl[m1]
                     chunks.append(v.reshape(-1))
                 if chunks:
@@ -2372,6 +2410,10 @@ class TerrainViewer3D:
                         print(f"[3D] north_dir={self.north_dir:+d} — reconstruyendo...")
                         self._build_terrain_mesh()
                         self._build_walkable_overlay()
+                    elif event.key == pygame.K_n:
+                        self.smooth_normals = not self.smooth_normals
+                        print(f"[3D] normales suaves={self.smooth_normals} — reconstruyendo...")
+                        self._build_terrain_mesh()
                     elif event.key == pygame.K_z:
                         self.flip_z = not self.flip_z
                         print(f"[3D] flip_z={self.flip_z} — reconstruyendo...")
