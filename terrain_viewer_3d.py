@@ -56,14 +56,35 @@ layout(location = 1) in vec2 in_uv;
 layout(location = 2) in vec3 in_normal;
 layout(location = 3) in vec2 in_lm_uv;
 uniform mat4 u_mvp;
+uniform vec3 u_light_dir;
+uniform vec3 u_diffuse_color;
+uniform vec3 u_ambient_color;
+uniform bool u_client_light;
 out vec2 v_uv;
 out vec2 v_lm_uv;
 out vec3 v_normal;
+out vec3 v_mult;
+// Iluminación del cliente RO tal como la replica BrowEdit3 (gnd.vs): se calcula
+// por vértice (interpolación lineal de color, como el cliente oficial) y mezcla
+// los colores ambiente y difuso del RSW. La "intensidad" del RSW no interviene.
+vec3 client_light_mult(vec3 nrm) {
+    float NL = clamp(dot(normalize(nrm), -normalize(u_light_dir)), 0.0, 1.0);
+    vec3 A = u_ambient_color;
+    vec3 D = u_diffuse_color;
+    vec3 af = (1.0 - A) * A;
+    vec3 amb = A - af + af * D;
+    vec3 df = (1.0 - D) * D;
+    vec3 dif = D - df + df * A;
+    vec3 mult1 = min(NL * dif + amb, 1.0);
+    vec3 mult2 = min(max(D, A) + (1.0 - max(D, A)) * min(D, A), 1.0);
+    return clamp(min(mult1, mult2), 0.0, 1.0);
+}
 void main() {
     gl_Position = u_mvp * vec4(in_pos, 1.0);
     v_uv = in_uv;
     v_lm_uv = in_lm_uv;
     v_normal = in_normal;
+    v_mult = u_client_light ? client_light_mult(in_normal) : vec3(1.0);
 }
 """
 
@@ -72,6 +93,8 @@ TERRAIN_FRAGMENT_SHADER = """
 in vec2 v_uv;
 in vec2 v_lm_uv;
 in vec3 v_normal;
+in vec3 v_mult;
+uniform bool u_client_light;
 uniform sampler2D u_texture;
 uniform sampler2D u_lightmap;
 uniform bool u_use_texture;
@@ -90,6 +113,20 @@ void main() {
         discard;
     if (u_use_texture && base.r > 0.85 && base.g < 0.20 && base.b > 0.85)
         discard;
+    if (u_client_light) {
+        // Igual que gnd.fs de BrowEdit3: textura * luz(vértice) * sombra(alfa del
+        // lightmap) + color del lightmap (aditivo).
+        vec3 c = base.rgb * v_mult;
+        if (u_use_lightmap) {
+            vec4 lm = texture(u_lightmap, v_lm_uv);
+            float ao = lm.a;
+            if (u_lm_invert_ao) ao = 1.0 - ao;
+            c *= clamp(ao, 0.0, 1.0);
+            c += clamp(lm.rgb, 0.0, 1.0);
+        }
+        frag_color = vec4(c, base.a);
+        return;
+    }
     vec3 n = normalize(v_normal);
     float ndotl = max(dot(n, -normalize(u_light_dir)), 0.05);
     vec3 lit = u_ambient_color + u_diffuse_color * (ndotl * u_intensity);
@@ -170,17 +207,52 @@ void main() {
 """
 
 
-def rsw_light_direction(rsw):
+def rsw_light_direction(rsw, client=True):
+    """Dirección en que VIAJA la luz (sistema de mundo del visor, Y arriba).
+
+    client=True: misma orientación que BrowEdit3 / cliente RO. Se comprobó con
+    las sombras horneadas del mapa (ver README): las sombras caen en el
+    sentido que da esta fórmula.
+    client=False: fórmula anterior del visor (azimut distinto), solo para
+    comparar con la tecla T.
+    """
     if rsw is None or rsw.light is None:
         return (-0.4, -0.8, -0.4)
     lon = math.radians(rsw.light['longitude'])
     lat = math.radians(rsw.light['latitude'])
+    if client:
+        return (math.sin(lon) * math.sin(lat),
+                -math.cos(lat),
+                -math.cos(lon) * math.sin(lat))
     x = -math.cos(lon) * math.sin(lat)
     y = math.cos(lat)
     z = math.sin(lon) * math.sin(lat)
     return (x, -y, z)
 
 
+
+
+def scene_light_params(rsw, use_rsw_light=True, for_models=False):
+    """Devuelve (ambiente, difusa, intensidad) para los shaders.
+
+    Con use_rsw_light=True se usan los valores reales del .rsw (colores
+    ambiente y difuso incluidos), como GRF Editor / el cliente: un mapa con
+    luz azulada se ve azulado/violeta. Con False (o sin RSW) se conserva la
+    luz neutra anterior.
+    """
+    light = getattr(rsw, 'light', None) if rsw is not None else None
+    if use_rsw_light and light:
+        def _c(v):
+            return tuple(max(0.0, min(1.0, float(x))) for x in v)
+        return (_c(light['ambient']), _c(light['diffuse']),
+                max(0.0, float(light.get('intensity', 0.5))))
+    # --- modo anterior (luz neutra) ---
+    if for_models:
+        return ((0.45, 0.45, 0.45), (1.0, 1.0, 1.0), 0.9)
+    intensity = 0.9
+    if light:
+        intensity = max(0.5, float(light.get('intensity', 0.5)) * 1.4)
+    return ((0.35, 0.35, 0.35), (1.0, 1.0, 1.0), intensity)
 
 
 def _scale3(x, y, z):
@@ -468,6 +540,7 @@ class TerrainViewer3D:
         self.show_walls = True
         self.flip_z = True
         self.smooth_normals = True  # N — normales suaves por vértice (como el cliente RO)
+        self.use_rsw_light = True   # T — luz ambiente/difusa/intensidad reales del .rsw
         self.show_compass = True
         self.show_walkable = False  # G
         self.show_models = False    # M — marcadores RSW
@@ -547,6 +620,7 @@ class TerrainViewer3D:
         self.u_use_texture = glGetUniformLocation(self.program, "u_use_texture")
         self.u_flat_color = glGetUniformLocation(self.program, "u_flat_color")
         self.u_light_dir = glGetUniformLocation(self.program, "u_light_dir")
+        self.u_client_light = glGetUniformLocation(self.program, "u_client_light")
         self.u_diffuse = glGetUniformLocation(self.program, "u_diffuse_color")
         self.u_ambient = glGetUniformLocation(self.program, "u_ambient_color")
         self.u_intensity = glGetUniformLocation(self.program, "u_intensity")
@@ -576,7 +650,8 @@ class TerrainViewer3D:
         el borde. Así el filtrado bilineal no cruza al tile vecino (cortes duros).
         """
         self.lm_atlas_tex = None
-        self.lm_atlas_info = {}
+        self.lm_atlas_info = {}          # UV estilo BrowEdit3 (inset 1.0 px)
+        self.lm_atlas_info_legacy = {}   # UV anterior del visor (inset 1.5 px)
         lms = getattr(self.gnd, 'lightmaps', None) or []
         if not lms:
             log_info("[3D] Sin lightmaps en el GND")
@@ -625,12 +700,20 @@ class TerrainViewer3D:
 
             # Inset ~1.5px (como el arreglo de paredes) + pad exterior
             # (el pad evita cortes en piso; el inset evita manchas en bordes de muro)
+            # BrowEdit3 (GndRenderer::Chunk::rebuild) mapea cada celda de +1 a
+            # lw-1 px del bloque lw x lh: el borde de 1 px del lightmap trae los
+            # valores de la celda vecina, y con filtro LINEAR eso da una
+            # transición continua entre celdas (salto 0.0000 medido en Comodo).
+            # Con el inset anterior (1.5 px) se muestreaba un texel distinto a
+            # cada lado del borde: escalones en sombras y parches cuadrados.
+            inset_bro = 1.0 if min(lw, lh) >= 4 else 0.5
+            self.lm_atlas_info[i] = (
+                (x0 + inset_bro) / float(aw), (y0 + inset_bro) / float(ah),
+                (x0 + lw - inset_bro) / float(aw), (y0 + lh - inset_bro) / float(ah))
             inset = 1.5 if min(lw, lh) >= 4 else 0.75
-            u0 = (x0 + inset) / float(aw)
-            v0 = (y0 + inset) / float(ah)
-            u1 = (x0 + lw - inset) / float(aw)
-            v1 = (y0 + lh - inset) / float(ah)
-            self.lm_atlas_info[i] = (u0, v0, u1, v1)
+            self.lm_atlas_info_legacy[i] = (
+                (x0 + inset) / float(aw), (y0 + inset) / float(ah),
+                (x0 + lw - inset) / float(aw), (y0 + lh - inset) / float(ah))
 
         if not PIL_AVAILABLE:
             # subir con OpenGL directo
@@ -685,7 +768,10 @@ class TerrainViewer3D:
         nd = self.north_dir
         flip_z = getattr(self, 'flip_z', False)
         show_walls = getattr(self, 'show_walls', True)
-        lm_info = getattr(self, 'lm_atlas_info', None) or {}
+        if getattr(self, 'use_rsw_light', True):
+            lm_info = getattr(self, 'lm_atlas_info', None) or {}
+        else:
+            lm_info = getattr(self, 'lm_atlas_info_legacy', None) or {}
         flip_u = getattr(self, 'lm_flip_u', True)
         flip_v = getattr(self, 'lm_flip_v', False)
         mode_n = getattr(self, 'lm_wall_mode_north', 2)
@@ -807,9 +893,12 @@ class TerrainViewer3D:
             # la esquina. Para no suavizar acantilados, solo se mezclan celdas
             # cuya esquina compartida está a la MISMA altura.
             if getattr(self, 'smooth_normals', True):
-                nc = n0 + n1                                   # normal de celda
-                ncl = np.linalg.norm(nc, axis=1, keepdims=True)
-                nc = np.divide(nc, ncl, out=np.zeros_like(nc), where=ncl > 1e-10)
+                # Igual que Gnd::Cube::calcNormal de BrowEdit3: cada esquina suma
+                # las normales de los triángulos que la tocan (bl: n0, br/tl:
+                # n0+n1, tr: n1). Ojo: en una esquina sin vecinos el cliente usa
+                # n0 también para tr ("it's just how it is in the client").
+                nsum = n0 + n1
+                nc_bl, nc_br, nc_tl, nc_tr = n0, nsum, nsum, n1
                 k_bot = ys - int(round(dz_bottom / 10.0))      # línea Z borde bottom
                 k_top = ys - int(round(dz_top / 10.0))         # línea Z borde top
                 def _q(h):
@@ -823,11 +912,17 @@ class TerrainViewer3D:
                 _, inv = np.unique(keys, axis=0, return_inverse=True)
                 inv = inv.reshape(-1)
                 acc = np.zeros((int(inv.max()) + 1, 3), dtype=np.float64)
-                np.add.at(acc, inv, np.concatenate((nc, nc, nc, nc)))
-                al = np.linalg.norm(acc, axis=1, keepdims=True)
-                acc = np.divide(acc, al, out=np.zeros_like(acc), where=al > 1e-10)
-                vn = acc[inv].reshape(4, n_top, 3)
-                vn_bl, vn_br, vn_tl, vn_tr = vn[0], vn[1], vn[2], vn[3]
+                np.add.at(acc, inv, np.concatenate((nc_bl, nc_br, nc_tl, nc_tr)))
+                inv_all = inv.reshape(4, n_top)
+                def _unit(v):
+                    l = np.linalg.norm(v, axis=1, keepdims=True)
+                    return np.divide(v, l, out=np.zeros_like(v), where=l > 1e-10)
+                vn_bl = _unit(acc[inv_all[0]])
+                vn_br = _unit(acc[inv_all[1]])
+                vn_tl = _unit(acc[inv_all[2]])
+                # esquina tr: la propia celda aporta n0 (valor por defecto del
+                # cliente) en lugar de n1; los vecinos sí aportan su n1.
+                vn_tr = _unit(acc[inv_all[3]] + (n0 - n1))
                 # celdas degeneradas (normal 0): conservar la plana
                 for _vn, _fb in ((vn_bl, n0), (vn_br, n0), (vn_tl, n0), (vn_tr, n1)):
                     bad = np.linalg.norm(_vn, axis=1) < 1e-6
@@ -2051,14 +2146,14 @@ class TerrainViewer3D:
         cam_mvp = mvp   # el bucle RSM reutiliza el nombre 'mvp'
         glUniformMatrix4fv(self.u_mvp, 1, GL_FALSE, mat4.to_gl(mvp))
 
-        light_dir = rsw_light_direction(self.rsw)
+        client_light = bool(getattr(self, 'use_rsw_light', True))
+        light_dir = rsw_light_direction(self.rsw, client_light)
         glUniform3f(self.u_light_dir, *light_dir)
-        ambient = 0.35
-        intensity = 0.9
-        if self.rsw and self.rsw.light:
-            intensity = max(0.5, float(self.rsw.light.get('intensity', 0.5)) * 1.4)
-        glUniform3f(self.u_diffuse, 1.0, 1.0, 1.0)
-        glUniform3f(self.u_ambient, ambient, ambient, ambient)
+        glUniform1i(self.u_client_light, 1 if client_light else 0)
+        amb_c, dif_c, intensity = scene_light_params(
+            self.rsw, getattr(self, 'use_rsw_light', True))
+        glUniform3f(self.u_diffuse, *dif_c)
+        glUniform3f(self.u_ambient, *amb_c)
         glUniform1f(self.u_intensity, intensity)
 
         use_lm = bool(getattr(self, 'show_shadows', True) and getattr(self, 'lm_atlas_tex', None))
@@ -2125,18 +2220,24 @@ class TerrainViewer3D:
                     'u_diff': glGetUniformLocation(self.rsm_program, "u_diffuse_color"),
                     'u_amb': glGetUniformLocation(self.rsm_program, "u_ambient_color"),
                     'u_int': glGetUniformLocation(self.rsm_program, "u_intensity"),
+                    'u_client': glGetUniformLocation(self.rsm_program, "u_client_light"),
                 }
                 self._rsm_uniform_cache = cache
             u_mvp, u_model = cache['u_mvp'], cache['u_model']
             u_tex, u_use = cache['u_tex'], cache['u_use']
+            _client = bool(getattr(self, 'use_rsw_light', True))
             if cache['u_light'] >= 0:
-                glUniform3f(cache['u_light'], *rsw_light_direction(self.rsw))
+                glUniform3f(cache['u_light'], *rsw_light_direction(self.rsw, _client))
+            if cache['u_client'] >= 0:
+                glUniform1i(cache['u_client'], 1 if _client else 0)
+            m_amb, m_dif, m_int = scene_light_params(
+                self.rsw, getattr(self, 'use_rsw_light', True), for_models=True)
             if cache['u_diff'] >= 0:
-                glUniform3f(cache['u_diff'], 1.0, 1.0, 1.0)
+                glUniform3f(cache['u_diff'], *m_dif)
             if cache['u_amb'] >= 0:
-                glUniform3f(cache['u_amb'], 0.45, 0.45, 0.45)
+                glUniform3f(cache['u_amb'], *m_amb)
             if cache['u_int'] >= 0:
-                glUniform1f(cache['u_int'], 0.9)
+                glUniform1f(cache['u_int'], m_int)
 
             # Culling: distancia + cono frontal ampliado (precarga al girar)
             # FOV real ~55°; usamos ~200° (casi hemisferio delantero + margen)
@@ -2410,6 +2511,10 @@ class TerrainViewer3D:
                         print(f"[3D] north_dir={self.north_dir:+d} — reconstruyendo...")
                         self._build_terrain_mesh()
                         self._build_walkable_overlay()
+                    elif event.key == pygame.K_t:
+                        self.use_rsw_light = not self.use_rsw_light
+                        print(f"[3D] modo BrowEdit3 (luz + lightmap UV)={self.use_rsw_light} — reconstruyendo...")
+                        self._build_terrain_mesh()
                     elif event.key == pygame.K_n:
                         self.smooth_normals = not self.smooth_normals
                         print(f"[3D] normales suaves={self.smooth_normals} — reconstruyendo...")
