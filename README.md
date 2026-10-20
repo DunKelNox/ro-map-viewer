@@ -138,8 +138,7 @@ Soporta **RSM1** y **RSM2** (incl. animación de mallas cuando el archivo la tra
 
 ## Limitaciones conocidas
 
-- Agua **multi-zona** del GND: el parser puede leer zonas; el render 3D aún
-  usa un plano al nivel global de agua.
+- Agua **multi-zona** del GND: Corregido
 - Algunas versiones intermedias de RSW/GND sin muestras reales pueden requerir
   ajustes de offset de header.
 - Efectos de partículas del cliente (`.lub` EffectTool) no se renderizan.
