@@ -46,14 +46,35 @@ layout(location = 2) in vec3 in_normal;
 uniform mat4 u_mvp;
 uniform mat4 u_model;
 uniform vec2 u_uv_offset;
+// Modo "cliente RO" (opcional; por defecto apagado = comportamiento anterior)
+uniform bool u_client_light;
+uniform vec3 u_light_dir;
+uniform vec3 u_diffuse_color;
+uniform vec3 u_ambient_color;
 
 out vec2 v_uv;
 out vec3 v_normal;
+out vec3 v_mult;
+
+// Misma fórmula que rsm.vs de BrowEdit3 (cálculo por vértice)
+vec3 client_light_mult(vec3 nrm) {
+    float NL = clamp(dot(normalize(nrm), -normalize(u_light_dir)), 0.0, 1.0);
+    vec3 A = u_ambient_color;
+    vec3 D = u_diffuse_color;
+    vec3 af = (1.0 - A) * A;
+    vec3 amb = A - af + af * D;
+    vec3 df = (1.0 - D) * D;
+    vec3 dif = D - df + df * A;
+    vec3 mult1 = min(NL * dif + amb, 1.0);
+    vec3 mult2 = min(max(D, A) + (1.0 - max(D, A)) * min(D, A), 1.0);
+    return min(mult1, mult2);
+}
 
 void main() {
     gl_Position = u_mvp * vec4(in_pos, 1.0);
     v_uv = in_uv + u_uv_offset;
     v_normal = mat3(u_model) * in_normal;
+    v_mult = u_client_light ? client_light_mult(v_normal) : vec3(1.0);
 }
 """
 
@@ -61,6 +82,7 @@ FRAGMENT_SHADER = """
 #version 330 core
 in vec2 v_uv;
 in vec3 v_normal;
+in vec3 v_mult;
 
 uniform sampler2D u_texture;
 uniform vec3 u_light_dir;
@@ -68,6 +90,7 @@ uniform vec3 u_diffuse_color;
 uniform vec3 u_ambient_color;
 uniform float u_intensity;
 uniform bool u_use_texture;
+uniform bool u_client_light;
 
 out vec4 frag_color;
 
@@ -85,6 +108,10 @@ void main() {
     if (u_use_texture && tex_color.r > 0.80 && tex_color.g < 0.25 && tex_color.b > 0.80)
         discard;
 
+    if (u_client_light) {
+        frag_color = vec4(tex_color.rgb * v_mult, tex_color.a);
+        return;
+    }
     vec3 n = normalize(v_normal);
     float ndotl = max(dot(n, -u_light_dir), 0.0);
     vec3 lit = u_ambient_color + u_diffuse_color * ndotl * u_intensity;
@@ -575,13 +602,12 @@ def apply_magenta_colorkey(img):
     return Image.fromarray(arr, 'RGBA')
 
 
-def load_texture_gl(path, generate_mipmaps=True):
+def load_texture_gl(path, generate_mipmaps=False):
     """Carga BMP/TGA/PNG/JPG con PIL y la sube como textura GL. Devuelve id GL o None.
     Deja en load_texture_gl.last_translucent si la textura tiene alfa parcial.
 
-    generate_mipmaps=True (default): mipmaps al cargar (visor de un solo modelo).
-    generate_mipmaps=False: solo nivel 0 + GL_LINEAR → carga más rápida; quien llama genera
-    los mipmaps después (ver TerrainViewer3D._mipmap_pending).
+    generate_mipmaps=False (default): solo nivel 0 + GL_LINEAR → carga más rápida.
+    Los mipmaps se pueden generar después (ver TerrainViewer3D._mipmap_pending).
     """
     load_texture_gl.last_translucent = False
     if not PIL_AVAILABLE:
