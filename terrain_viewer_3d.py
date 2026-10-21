@@ -95,6 +95,7 @@ in vec2 v_lm_uv;
 in vec3 v_normal;
 in vec3 v_mult;
 uniform bool u_client_light;
+uniform bool u_unlit;   // overlays/marcadores: color plano sin luz de escena
 uniform sampler2D u_texture;
 uniform sampler2D u_lightmap;
 uniform bool u_use_texture;
@@ -113,6 +114,10 @@ void main() {
         discard;
     if (u_use_texture && base.r > 0.85 && base.g < 0.20 && base.b > 0.85)
         discard;
+    if (u_unlit) {
+        frag_color = base;
+        return;
+    }
     if (u_client_light) {
         // Igual que gnd.fs de BrowEdit3: textura * luz(vértice) * sombra(alfa del
         // lightmap) + color del lightmap (aditivo).
@@ -542,6 +547,15 @@ class TerrainViewer3D:
         self.smooth_normals = True  # N — normales suaves por vértice (como el cliente RO)
         self.use_rsw_light = True   # T — luz ambiente/difusa/intensidad reales del .rsw
         self.show_compass = True
+        # Elevación del overlay G sobre la malla GAT. El GAT (celdas de 5) y el GND
+        # (celdas de 10) no coinciden exactamente: en ~20% de las celdas el terreno
+        # queda unas décimas POR ENCIMA del overlay y, con el rango de profundidad de
+        # la cámara, el polygon offset (~0.01 u) no alcanza: el terreno asoma como
+        # parches poligonales ("rombos"). 0.5 u cubre ~99% de los casos.
+        self.gat_overlay_lift = 0.5
+        self.show_cell_info = False       # P — marca la celda y muestra coordenadas
+        self.cell_floor = 'gnd'           # Shift+P — piso: 'gnd' (terreno) | 'gat' (caminable/bloqueado)
+        self._cell_info = None
         self.show_walkable = False  # G
         self.show_models = False    # M — marcadores RSW
         self.show_rsm = True        # R — modelos 3D RSM
@@ -621,6 +635,7 @@ class TerrainViewer3D:
         self.u_flat_color = glGetUniformLocation(self.program, "u_flat_color")
         self.u_light_dir = glGetUniformLocation(self.program, "u_light_dir")
         self.u_client_light = glGetUniformLocation(self.program, "u_client_light")
+        self.u_unlit = glGetUniformLocation(self.program, "u_unlit")
         self.u_diffuse = glGetUniformLocation(self.program, "u_diffuse_color")
         self.u_ambient = glGetUniformLocation(self.program, "u_ambient_color")
         self.u_intensity = glGetUniformLocation(self.program, "u_intensity")
@@ -1475,8 +1490,8 @@ class TerrainViewer3D:
 
         WALKABLE = (0, 3)
         green, red = [], []
-        # Ligeramente por encima de la altura GAT para evitar z-fight con GND
-        EPS = 0.0
+        # Elevación del overlay sobre la altura GAT (ver gat_overlay_lift en __init__)
+        EPS = float(getattr(self, 'gat_overlay_lift', 0.0))
 
         def add_cell(buf, gx, gy, block, fx, fy, edge_buf=None):
             h_ul = block['upper_left']
@@ -2128,6 +2143,487 @@ class TerrainViewer3D:
         z = self.cam_dist * math.cos(pitch) * math.cos(yaw)
         return (x + self.cam_target[0], y + self.cam_target[1], z + self.cam_target[2])
 
+    # ------------------------------------------------------------------
+    # Celda bajo el cursor / centro de cámara: marcador + coordenadas (tecla P)
+    # ------------------------------------------------------------------
+    def _ensure_ground_grid(self):
+        """Alturas (Y mundo = -h) de las 4 esquinas de cada celda GND: [bl, br, tl, tr]."""
+        if getattr(self, '_ggrid', None) is not None:
+            return
+        W, H = self.gnd.width, self.gnd.height
+        arr = np.empty((4, W * H), dtype=np.float64)
+        for i, c in enumerate(self.gnd.cubes):
+            arr[0, i] = -c['h_bottom_left']
+            arr[1, i] = -c['h_bottom_right']
+            arr[2, i] = -c['h_top_left']
+            arr[3, i] = -c['h_top_right']
+        self._ggrid = arr.reshape(4, H, W)
+
+    def _ground_y(self, X, Z):
+        """Altura Y del terreno GND exactamente como se dibuja (2 triángulos por
+        celda, diagonal br-tl). X, Z: escalares o arrays.
+        Devuelve (Y, celda_x, celda_y, dentro_del_mapa)."""
+        self._ensure_ground_grid()
+        X = np.asarray(X, dtype=np.float64)
+        Z = np.asarray(Z, dtype=np.float64)
+        W, H = self.gnd.width, self.gnd.height
+        cx = np.floor(X / 10.0).astype(np.int64)
+        # la fila y cubre Z en (10H-10y, 10H-10y+10]
+        cy = np.floor((10.0 * H - Z) / 10.0).astype(np.int64) + 1
+        inside = (cx >= 0) & (cx < W) & (cy >= 0) & (cy < H)
+        cxc = np.clip(cx, 0, W - 1)
+        cyc = np.clip(cy, 0, H - 1)
+        u = (X - 10.0 * cxc) / 10.0
+        v = (Z - (10.0 * H - 10.0 * cyc)) / 10.0
+        vb, vt = (1.0, 0.0) if getattr(self, 'flip_z', False) else (0.0, 1.0)
+        ybl, ybr, ytl, ytr = (self._ggrid[k][cyc, cxc] for k in range(4))
+
+        def bary(ax, av, bx, bv, cx_, cv, px, pv):
+            d = (bx - ax) * (cv - av) - (cx_ - ax) * (bv - av)
+            w1 = ((px - ax) * (cv - av) - (cx_ - ax) * (pv - av)) / d
+            w2 = ((bx - ax) * (pv - av) - (px - ax) * (bv - av)) / d
+            return 1.0 - w1 - w2, w1, w2
+
+        a0, b0, c0 = bary(0.0, vb, 1.0, vb, 0.0, vt, u, v)       # bl, br, tl
+        in0 = (a0 >= -1e-9) & (b0 >= -1e-9) & (c0 >= -1e-9)
+        y0 = a0 * ybl + b0 * ybr + c0 * ytl
+        a1, b1, c1 = bary(1.0, vb, 1.0, vt, 0.0, vt, u, v)       # br, tr, tl
+        y1 = a1 * ybr + b1 * ytr + c1 * ytl
+        return np.where(in0, y0, y1), cx, cy, inside
+
+    def _ensure_gat_grid(self):
+        """Alturas (Y mundo) de las 4 esquinas de cada celda GAT tal como las dibuja
+        el overlay (reorientadas según los espejos): [ul, ur, ll, lr] indexadas por
+        la celda del archivo (gx, gy)."""
+        key = (bool(getattr(self, 'gat_flip_x', False)),
+               bool(getattr(self, 'gat_flip_y', True)),
+               bool(getattr(self, 'gat_flip_heights', False)))
+        if getattr(self, '_gatgrid', None) is not None and self._gatgrid_key == key:
+            return
+        gw, gh = self.gat.width, self.gat.height
+        blocks = self.gat.blocks[:gw * gh]
+
+        def col(name):
+            return np.array([b[name] for b in blocks], dtype=np.float64).reshape(gh, gw)
+
+        ul, ur, ll, lr = col('upper_left'), col('upper_right'), col('lower_left'), col('lower_right')
+        fx, fy, fh = key
+        if fx:
+            ul, ur = ur, ul
+            ll, lr = lr, ll
+        if fy:
+            ul, ll = ll, ul
+            ur, lr = lr, ur
+        if fh:
+            ul, ll = ll, ul
+            ur, lr = lr, ur
+        self._gatgrid = -np.stack((ul, ur, ll, lr))
+        self._gatgrid_key = key
+
+    def _gat_y(self, X, Z):
+        """Altura Y de la superficie GAT (la malla del overlay G: 2 triángulos por
+        celda, diagonal ul-lr). Puede estar en el aire (puentes).
+        Devuelve (Y, dentro_del_mapa)."""
+        self._ensure_gat_grid()
+        X = np.asarray(X, dtype=np.float64)
+        Z = np.asarray(Z, dtype=np.float64)
+        gw, gh = self.gat.width, self.gat.height
+        off_x = getattr(self, 'gat_off_x', 0.0)
+        off_z = getattr(self, 'gat_off_z', 0.0)
+        flip_z = bool(getattr(self, 'flip_z', False))
+        px = np.floor((X - off_x) / 5.0).astype(np.int64)
+        zi = np.floor((Z - off_z) / 5.0).astype(np.int64)
+        py = zi if flip_z else gh - 1 - zi
+        gx = (gw - 1 - px) if getattr(self, 'gat_flip_x', False) else px
+        gy = (gh - 1 - py) if getattr(self, 'gat_flip_y', True) else py
+        inside = (gx >= 0) & (gx < gw) & (gy >= 0) & (gy < gh)
+        gxc = np.clip(gx, 0, gw - 1)
+        gyc = np.clip(gy, 0, gh - 1)
+        u = (X - off_x - 5.0 * px) / 5.0
+        zlo = 5.0 * py if flip_z else 5.0 * (gh - py - 1)
+        v = (Z - off_z - zlo) / 5.0
+        vu, vl = (0.0, 1.0) if flip_z else (1.0, 0.0)
+        hul, hur, hll, hlr = (self._gatgrid[k][gyc, gxc] for k in range(4))
+
+        def bary(ax, av, bx, bv, cx_, cv, px_, pv):
+            d = (bx - ax) * (cv - av) - (cx_ - ax) * (bv - av)
+            w1 = ((px_ - ax) * (cv - av) - (cx_ - ax) * (pv - av)) / d
+            w2 = ((bx - ax) * (pv - av) - (px_ - ax) * (bv - av)) / d
+            return 1.0 - w1 - w2, w1, w2
+
+        a0, b0, c0 = bary(0.0, vu, 1.0, vu, 1.0, vl, u, v)       # ul, ur, lr
+        in0 = (a0 >= -1e-9) & (b0 >= -1e-9) & (c0 >= -1e-9)
+        y0 = a0 * hul + b0 * hur + c0 * hlr
+        a1, b1, c1 = bary(0.0, vu, 1.0, vl, 0.0, vl, u, v)       # ul, lr, ll
+        y1 = a1 * hul + b1 * hlr + c1 * hll
+        return np.where(in0, y0, y1), inside
+
+    def _floor_y(self, X, Z, floor):
+        """(Y, dentro) del piso elegido: 'gnd' = terreno, 'gat' = superficie GAT."""
+        if floor == 'gat' and self.gat is not None:
+            return self._gat_y(X, Z)
+        Y, _cx, _cy, inside = self._ground_y(X, Z)
+        return Y, inside
+
+    def _mouse_ray(self, mx, my):
+        """Rayo (origen, dirección) en mundo para el píxel (mx, my) de la ventana."""
+        proj = mat4.perspective(55.0, self.width / self.height, 0.5, self.model_radius * 20)
+        eye = self._camera_position()
+        view = mat4.look_at(eye, self.cam_target, (0, 1, 0))
+        inv = np.linalg.inv((proj @ view).astype(np.float64))
+        nx = 2.0 * mx / float(self.width) - 1.0
+        ny = 1.0 - 2.0 * my / float(self.height)
+        p0 = inv @ np.array([nx, ny, -1.0, 1.0])
+        p1 = inv @ np.array([nx, ny, 1.0, 1.0])
+        p0 = p0[:3] / p0[3]
+        p1 = p1[:3] / p1[3]
+        d = p1 - p0
+        return p0, d / np.linalg.norm(d)
+
+    def _pick_terrain(self, mx, my, floor='gnd'):
+        """Punto (X, Z) donde el rayo del píxel toca el piso elegido ('gnd' = terreno,
+        'gat' = superficie GAT), o None."""
+        o, d = self._mouse_ray(mx, my)
+        tmax = self.model_radius * 6.0
+        t = np.linspace(0.0, tmax, 4000)
+        P = o[None, :] + t[:, None] * d[None, :]
+        Y, inside = self._floor_y(P[:, 0], P[:, 2], floor)
+        below = inside & (P[:, 1] <= Y)
+        idx = np.nonzero(below)[0]
+        if idx.size == 0:
+            return None
+        i = int(idx[0])
+        if i == 0:
+            return None                     # cámara bajo el terreno
+        lo, hi = float(t[i - 1]), float(t[i])
+        for _ in range(32):                 # refinar el cruce por bisección
+            mid = 0.5 * (lo + hi)
+            q = o + mid * d
+            y, ins = self._floor_y(q[0], q[2], floor)
+            if (not bool(ins)) or q[1] > float(y):
+                lo = mid
+            else:
+                hi = mid
+        q = o + hi * d
+        return float(q[0]), float(q[2])
+
+    def _world_to_gat(self, X, Z):
+        """Inversa del mapeo del overlay GAT: (X, Z) mundo -> (x, y) de la celda del
+        archivo .gat (coordenadas de juego)."""
+        if self.gat is None:
+            return None
+        gw, gh = self.gat.width, self.gat.height
+        px = int(math.floor((X - getattr(self, 'gat_off_x', 0.0)) / 5.0))
+        zz = Z - getattr(self, 'gat_off_z', 0.0)
+        if getattr(self, 'flip_z', False):
+            py = int(math.floor(zz / 5.0))
+        else:
+            py = gh - 1 - int(math.floor(zz / 5.0))
+        gx = (gw - 1 - px) if getattr(self, 'gat_flip_x', False) else px
+        gy = (gh - 1 - py) if getattr(self, 'gat_flip_y', True) else py
+        return gx, gy
+
+    def _gat_cell_bounds(self, gx, gy):
+        """Rectángulo mundo (x0, x1, z0, z1) de la celda GAT (gx, gy), con el mismo
+        mapeo que _build_walkable_overlay."""
+        gw, gh = self.gat.width, self.gat.height
+        px = (gw - 1 - gx) if getattr(self, 'gat_flip_x', False) else gx
+        py = (gh - 1 - gy) if getattr(self, 'gat_flip_y', True) else gy
+        pts = [self._gat_corner(px, py, c, 0.0)
+               for c in ('upper_left', 'upper_right', 'lower_left', 'lower_right')]
+        xs = [q[0] for q in pts]
+        zs = [q[2] for q in pts]
+        return min(xs), max(xs), min(zs), max(zs)
+
+    def _compute_cell_info(self):
+        """Celda bajo el cursor sobre el piso elegido (GND o GAT). None si no hay."""
+        floor = self.cell_floor
+        if not pygame.mouse.get_focused():
+            return None
+        mx, my = pygame.mouse.get_pos()
+        pt = self._pick_terrain(mx, my, floor)
+        if pt is None:
+            return None
+        X, Z = pt
+        y_gnd, cx, cy, in_gnd = self._ground_y(X, Z)
+        info = {
+            'floor': floor, 'X': X, 'Z': Z,
+            'gnd': (int(cx), int(cy)) if bool(in_gnd) else None,
+            'y_gnd': float(y_gnd) if bool(in_gnd) else None,
+            'gat': None, 'gat_type': None, 'gat_walk': None, 'y_gat': None,
+        }
+        if self.gat is not None:
+            g = self._world_to_gat(X, Z)
+            blk = self.gat.get_block(g[0], g[1]) if g is not None else None
+            if blk is not None:
+                info['gat'] = (int(g[0]), int(g[1]))
+                info['gat_type'] = blk['type']
+                info['gat_walk'] = blk['type'] in (0, 3)
+                info['y_gat'] = float(self._gat_y(X, Z)[0])
+        Y = info['y_gat'] if (floor == 'gat' and info['y_gat'] is not None) else info['y_gnd']
+        if Y is None:
+            return None
+        info['Y'] = Y
+        # Coordenadas RSW (inversa de _rsw_to_world) para ubicar modelos
+        gw, gh = self.gnd.width, self.gnd.height
+        info['rsw'] = (X - 5.0 * gw, -float(Y), 5.0 * gh + 10.0 - Z)
+        return info
+
+    def _cell_marker_geometry(self, info):
+        """Vértices (x,y,z,u,v,nx,ny,nz) pegados al piso elegido: relleno de la celda
+        GAT, contorno GAT (+ poste) y contorno de la celda GND. 3 arrays float32."""
+        eps = 0.02
+        on_gat = (info['floor'] == 'gat' and self.gat is not None)
+
+        def hf_gnd(XX, ZZ):
+            return self._ground_y(XX, ZZ)[0]
+
+        def hf_gat(XX, ZZ):
+            return self._gat_y(XX, ZZ)[0]
+
+        hf_cell = hf_gat if on_gat else hf_gnd      # la celda GAT sigue al piso elegido
+        # Sobre una plataforma/puente los modelos RSM suelen sobresalir unas décimas
+        # del GAT: se sube el marcador para que no lo tape la geometría del modelo.
+        up = 0.45 if on_gat else 0.0
+        # con el overlay G visible (elevado), el marcador sube lo mismo para no quedar debajo
+        ov = float(getattr(self, 'gat_overlay_lift', 0.0)) if getattr(self, 'show_walkable', False) else 0.0
+
+        def grid(x0, x1, z0, z1, n, lift, hf):
+            xs = np.linspace(x0 + eps, x1 - eps, n + 1)
+            zs = np.linspace(z0 + eps, z1 - eps, n + 1)
+            XX, ZZ = np.meshgrid(xs, zs)
+            Y = hf(XX.ravel(), ZZ.ravel()).reshape(XX.shape) + lift
+            return XX, Y, ZZ
+
+        def vert(x, y, z):
+            return [x, y, z, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+        def fill(XX, Y, ZZ):
+            out = []
+            n = XX.shape[0] - 1
+            for j in range(n):
+                for i in range(n):
+                    a = vert(XX[j, i], Y[j, i], ZZ[j, i])
+                    b = vert(XX[j, i + 1], Y[j, i + 1], ZZ[j, i + 1])
+                    c = vert(XX[j + 1, i + 1], Y[j + 1, i + 1], ZZ[j + 1, i + 1])
+                    d = vert(XX[j + 1, i], Y[j + 1, i], ZZ[j + 1, i])
+                    out += a + b + c + a + c + d
+            return np.array(out, dtype=np.float32)
+
+        def outline(XX, Y, ZZ):
+            n = XX.shape[0] - 1
+            ring = ([(0, i) for i in range(n + 1)]
+                    + [(j, n) for j in range(1, n + 1)]
+                    + [(n, i) for i in range(n - 1, -1, -1)]
+                    + [(j, 0) for j in range(n - 1, 0, -1)])
+            pts = [vert(XX[j, i], Y[j, i], ZZ[j, i]) for j, i in ring]
+            out = []
+            for k in range(len(pts)):
+                out += pts[k] + pts[(k + 1) % len(pts)]
+            return np.array(out, dtype=np.float32)
+
+        H = self.gnd.height
+        if info['gnd'] is not None:
+            cx, cy = info['gnd']
+            gnd_ring = outline(*grid(10.0 * cx, 10.0 * cx + 10.0,
+                                     10.0 * H - 10.0 * cy, 10.0 * H - 10.0 * cy + 10.0,
+                                     10, 0.25 + ov, hf_gnd))
+        else:
+            gnd_ring = np.zeros(0, dtype=np.float32)
+        if info['gat'] is not None:
+            x0, x1, z0, z1 = self._gat_cell_bounds(*info['gat'])
+            fill_v = fill(*grid(x0, x1, z0, z1, 5, up + ov, hf_cell))
+            ring = outline(*grid(x0, x1, z0, z1, 5, 0.25 + up + ov, hf_cell))
+            xm, zm = 0.5 * (x0 + x1), 0.5 * (z0 + z1)
+            ym = float(hf_cell(xm, zm))
+            pole = np.array(vert(xm, ym + 0.25 + up + ov, zm) + vert(xm, ym + 28.0, zm), dtype=np.float32)
+            gat_ring = np.concatenate((ring, pole))
+        else:
+            fill_v = np.zeros(0, dtype=np.float32)
+            gat_ring = np.zeros(0, dtype=np.float32)
+        return fill_v, gat_ring, gnd_ring
+
+    def _draw_cell_marker(self, info):
+        fill_v, gat_ring, gnd_ring = self._cell_marker_geometry(info)
+        arr = np.concatenate((fill_v, gat_ring, gnd_ring)).astype(np.float32)
+        if arr.size == 0:
+            return
+        if getattr(self, '_cell_vao', None) is None:
+            self._cell_vao = glGenVertexArrays(1)
+            self._cell_vbo = glGenBuffers(1)
+            glBindVertexArray(self._cell_vao)
+            glBindBuffer(GL_ARRAY_BUFFER, self._cell_vbo)
+            stride = 8 * 4
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+            glEnableVertexAttribArray(1)
+            glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(20))
+            glEnableVertexAttribArray(2)
+        glBindVertexArray(self._cell_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._cell_vbo)
+        glBufferData(GL_ARRAY_BUFFER, arr.nbytes, arr, GL_DYNAMIC_DRAW)
+
+        n_fill = fill_v.size // 8
+        n_gat = gat_ring.size // 8
+        n_gnd = gnd_ring.size // 8
+        glUseProgram(self.program)
+        glUniform1i(self.u_use_texture, 0)
+        glUniform1i(self.u_use_lightmap, 0)
+        glUniform1i(self.u_unlit, 1)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        if n_fill:
+            glEnable(GL_POLYGON_OFFSET_FILL)
+            glPolygonOffset(-3.0, -3.0)
+            glUniform4f(self.u_flat_color, 1.0, 0.85, 0.10, 0.50)
+            glDrawArrays(GL_TRIANGLES, 0, n_fill)
+            glDisable(GL_POLYGON_OFFSET_FILL)
+        try:
+            glLineWidth(3.0)
+        except Exception:
+            pass
+        if n_gat:
+            glUniform4f(self.u_flat_color, 1.0, 0.95, 0.25, 1.0)
+            glDrawArrays(GL_LINES, n_fill, n_gat)
+        if n_gnd:
+            glUniform4f(self.u_flat_color, 0.30, 0.95, 1.0, 0.95)
+            glDrawArrays(GL_LINES, n_fill + n_gat, n_gnd)
+        try:
+            glLineWidth(1.0)        # no dejar el grosor cambiado para el resto del frame
+        except Exception:
+            pass
+        glDisable(GL_BLEND)
+        glUniform1i(self.u_unlit, 0)
+        glBindVertexArray(0)
+
+    # --- Texto en pantalla (HUD) -----------------------------------------
+    def _hud_init(self):
+        vs = shaders.compileShader("""
+#version 330 core
+layout(location = 0) in vec2 in_pos;
+layout(location = 1) in vec2 in_uv;
+uniform vec2 u_screen;
+out vec2 v_uv;
+void main() {
+    gl_Position = vec4(in_pos.x / u_screen.x * 2.0 - 1.0,
+                       1.0 - in_pos.y / u_screen.y * 2.0, 0.0, 1.0);
+    v_uv = in_uv;
+}
+""", GL_VERTEX_SHADER)
+        fs = shaders.compileShader("""
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 frag_color;
+void main() { frag_color = texture(u_tex, v_uv); }
+""", GL_FRAGMENT_SHADER)
+        self._hud_prog = shaders.compileProgram(vs, fs)
+        self._hud_u_screen = glGetUniformLocation(self._hud_prog, "u_screen")
+        self._hud_u_tex = glGetUniformLocation(self._hud_prog, "u_tex")
+        self._hud_vao = glGenVertexArrays(1)
+        self._hud_vbo = glGenBuffers(1)
+        glBindVertexArray(self._hud_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._hud_vbo)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(8))
+        glEnableVertexAttribArray(1)
+        glBindVertexArray(0)
+        self._hud_tex = None
+        self._hud_key = None
+        self._hud_size = (0, 0)
+        self._hud_font = pygame.font.SysFont("consolas", 16)
+
+    def _hud_text_surface(self, lines):
+        """Panel semitransparente con las líneas [(texto, (r,g,b)), ...]."""
+        font = self._hud_font
+        pad = 8
+        rendered = [font.render(t, True, c) for t, c in lines]
+        w = max(r.get_width() for r in rendered) + 2 * pad
+        lh = font.get_linesize()
+        h = lh * len(rendered) + 2 * pad
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill((0, 0, 0, 175))
+        for i, r in enumerate(rendered):
+            surf.blit(r, (pad, pad + i * lh))
+        return surf
+
+    def _draw_hud_lines(self, lines, x=10, y=10):
+        if getattr(self, '_hud_prog', None) is None:
+            self._hud_init()
+        key = tuple(lines)
+        if key != self._hud_key:
+            surf = self._hud_text_surface(lines)
+            data = pygame.image.tostring(surf, "RGBA", False)
+            if self._hud_tex is None:
+                self._hud_tex = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, self._hud_tex)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surf.get_width(), surf.get_height(),
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            self._hud_key = key
+            self._hud_size = (surf.get_width(), surf.get_height())
+        w, h = self._hud_size
+        quad = np.array([
+            x, y, 0.0, 0.0,   x + w, y, 1.0, 0.0,   x + w, y + h, 1.0, 1.0,
+            x, y, 0.0, 0.0,   x + w, y + h, 1.0, 1.0,   x, y + h, 0.0, 1.0,
+        ], dtype=np.float32)
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glUseProgram(self._hud_prog)
+        glUniform2f(self._hud_u_screen, float(self.width), float(self.height))
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self._hud_tex)
+        glUniform1i(self._hud_u_tex, 0)
+        glBindVertexArray(self._hud_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._hud_vbo)
+        glBufferData(GL_ARRAY_BUFFER, quad.nbytes, quad, GL_DYNAMIC_DRAW)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+        glBindVertexArray(0)
+        glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+        glUseProgram(self.program)
+
+    def _cell_info_lines(self, info):
+        piso = ('GAT (caminable / bloqueado)' if self.cell_floor == 'gat'
+                else 'GND (terreno)')
+        WHITE, YEL, CYAN, GREY = (235, 235, 235), (255, 230, 90), (110, 235, 255), (170, 170, 170)
+        lines = [(f"CELDA  (piso: {piso})", YEL)]
+        if info is None:
+            lines.append(("Sin piso bajo el cursor", WHITE))
+        else:
+            if info['gat'] is not None:
+                walk = 'caminable' if info['gat_walk'] else 'bloqueada'
+                lines.append((f"GAT x,y   : {info['gat'][0]}, {info['gat'][1]}   "
+                              f"(tipo {info['gat_type']}, {walk})", YEL))
+            elif self.gat is None:
+                lines.append(("GAT x,y   : (sin archivo .gat)", GREY))
+            else:
+                lines.append(("GAT x,y   : fuera del mapa", GREY))
+            if info['gnd'] is not None:
+                lines.append((f"GND x,y   : {info['gnd'][0]}, {info['gnd'][1]}", CYAN))
+            lines.append((f"Mundo X,Z : {info['X']:.1f}, {info['Z']:.1f}", WHITE))
+            if info['y_gnd'] is not None:
+                lines.append((f"Altura GND: {info['y_gnd']:.2f}   (h = {-info['y_gnd']:.2f})", WHITE))
+            if info['y_gat'] is not None:
+                extra = ''
+                if info['y_gnd'] is not None:
+                    d = info['y_gat'] - info['y_gnd']
+                    if abs(d) >= 0.05:
+                        extra = f"   ({d:+.2f} sobre GND)" if d > 0 else f"   ({-d:.2f} bajo GND)"
+                lines.append((f"Altura GAT: {info['y_gat']:.2f}{extra}", WHITE))
+            rx, ry, rz = info['rsw']
+            lines.append((f"RSW x,y,z : {rx:.1f}, {ry:.1f}, {rz:.1f}", GREY))
+        lines.append(("P: ocultar | Shift+P: piso GND/GAT", GREY))
+        return lines
+
     def render_frame(self):
         glViewport(0, 0, self.width, self.height)
         glEnable(GL_DEPTH_TEST)
@@ -2138,6 +2634,7 @@ class TerrainViewer3D:
         # dejaba así, sin querer, el dibujo de las letras de la brújula al final del frame)
         glDisable(GL_BLEND)
         glUseProgram(self.program)
+        glUniform1i(self.u_unlit, 0)
 
         proj = mat4.perspective(55.0, self.width / self.height, 0.5, self.model_radius * 20)
         eye = self._camera_position()
@@ -2346,9 +2843,16 @@ class TerrainViewer3D:
         if wmode in (3, 4) and self.water_zones:
             self._draw_water_animated(cam_mvp, procedural=(wmode == 4))
 
+        # Overlays/marcadores/brújula: en modo BrowEdit3 se dibujan sin la luz de la
+        # escena (si no, el color del mapa los tiñe y oscurece)
+        glUniform1i(self.u_unlit, 1 if client_light else 0)
         if getattr(self, 'show_walkable', False) and getattr(self, 'walkable_bufs', None):
             # Con depth test: las murallas ocultan el overlay (sin visión de rayos X)
             glEnable(GL_DEPTH_TEST)
+            # Transparencia explícita: antes dependía del estado que dejara el bloque de
+            # modelos (R encendida => mezcla activa; R apagada => overlay sólido)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
             glEnable(GL_POLYGON_OFFSET_FILL)
             glPolygonOffset(-3.0, -3.0)
             glUniform1i(self.u_use_texture, 0)
@@ -2369,6 +2873,7 @@ class TerrainViewer3D:
                 glBindVertexArray(self.walkable_edge_vao)
                 glDrawArrays(GL_LINES, 0, self.walkable_edge_count)
                 glBindVertexArray(0)
+            glDisable(GL_BLEND)
 
         if getattr(self, 'show_models', False) and getattr(self, 'model_marker_vao', None):
             glUniform1i(self.u_use_texture, 0)
@@ -2390,6 +2895,13 @@ class TerrainViewer3D:
                 glDrawArrays(GL_LINES, i * 2, 2)
             glBindVertexArray(0)
             glEnable(GL_DEPTH_TEST)
+        glUniform1i(self.u_unlit, 0)
+
+        if getattr(self, 'show_cell_info', False):
+            self._cell_info = self._compute_cell_info()
+            if self._cell_info is not None:
+                self._draw_cell_marker(self._cell_info)
+            self._draw_hud_lines(self._cell_info_lines(self._cell_info))
 
         pygame.display.flip()
 
@@ -2401,6 +2913,7 @@ class TerrainViewer3D:
         running = True
         font = pygame.font.SysFont("consolas", 16)
         log_info("[3D] Mouse izq=pan der=orbit | G caminable M marcadores R RSM A anim S sombras")
+        log_info("[3D] P = marcar celda y mostrar coordenadas | Shift+P = piso GND/GAT")
         log_info("[3D] Nudge RSM: J/L = X±1  I/K = Z±1  (Shift=±5)  Home=reset | { } draw_dist | ESC")
         while running:
             for event in pygame.event.get():
@@ -2511,6 +3024,17 @@ class TerrainViewer3D:
                         print(f"[3D] north_dir={self.north_dir:+d} — reconstruyendo...")
                         self._build_terrain_mesh()
                         self._build_walkable_overlay()
+                    elif event.key == pygame.K_p:
+                        if event.mod & pygame.KMOD_SHIFT:
+                            if self.gat is None:
+                                print("[3D] No hay archivo .gat: solo se puede usar el piso GND")
+                            else:
+                                self.cell_floor = 'gat' if self.cell_floor == 'gnd' else 'gnd'
+                                print(f"[3D] marcador de celda: piso={self.cell_floor.upper()}")
+                        else:
+                            self.show_cell_info = not self.show_cell_info
+                            print(f"[3D] marcador de celda={'ON' if self.show_cell_info else 'off'}"
+                                  f" (piso={self.cell_floor.upper()})")
                     elif event.key == pygame.K_t:
                         self.use_rsw_light = not self.use_rsw_light
                         print(f"[3D] modo BrowEdit3 (luz + lightmap UV)={self.use_rsw_light} — reconstruyendo...")
